@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>高德地图示例</title>
+
+    <style>
+        #map {
+            height: 600px;
+        }
+
+        #p2p {
+            position: absolute;
+            top: 10px;
+            /* 调整按钮的垂直位置 */
+            left: 130px;
+            /* 调整按钮的水平位置 */
+            z-index: 1000;
+            /* 确保按钮在地图之上 */
+            padding: 10px;
+            background-color: white;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+        }
+
+        #clean {
+            position: absolute;
+            top: 10px;
+            /* 调整按钮的垂直位置 */
+            left: 30px;
+            /* 调整按钮的水平位置 */
+            z-index: 1000;
+            /* 确保按钮在地图之上 */
+            padding: 10px;
+            background-color: white;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+        }
+
+        #path {
+            position: absolute;
+            top: 10px;
+            /* 调整按钮的垂直位置 */
+            left: 30px;
+            /* 调整按钮的水平位置 */
+            z-index: 1000;
+            /* 确保按钮在地图之上 */
+            padding: 10px;
+            background-color: white;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <button id="p2p" , class="btn">高德路径</button>
+    <button id="clean" , class="btn">清除路径</button>
+
+    <script
+        src="https://webapi.amap.com/maps?v=1.4.15&key=	f3f968c0ce4a4679cb8ba489152bad0e&plugin=AMap.Driving"></script>
+    <script> //更换自己的API key js端的
+        var map = new AMap.Map('map', {
+            // center: [113.5, 34.8], // 经度, 纬度
+            center: [116.4, 39.9], // 经度, 纬度
+            zoom: 13 // 缩放级别
+        });
+
+        let points = [];
+        let markers = [];
+        let polyline;
+
+        map.on('click', function (e) {
+            var lat = e.lnglat.lat;
+            var lng = e.lnglat.lng;
+            console.log('点击位置: ', lat, lng);
+            points.push({ 'lat': lat, 'lng': lng });
+
+            var marker = new AMap.Marker({
+                position: e.lnglat
+            });
+            map.add(marker);
+            markers.push(marker);
+
+            var infoWindow = new AMap.InfoWindow({
+                content: `点击位置: ${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+                position: e.lnglat
+            });
+            infoWindow.open(map, e.lnglat);
+        });
+
+        document.getElementById("clean").addEventListener('click', function () {
+            console.log('清除点');
+            points = [];
+            if (polyline) {
+                map.remove(polyline);
+            };
+            if (markers) {
+                markers.forEach(marker => {
+                    map.remove(marker);
+                });
+            };
+        });
+
+        document.getElementById('p2p').addEventListener('click', async function () {
+            console.log('排序被点击');
+            if (points.length === 0) {
+                console.log('没有可用的路径点');
+                return;
+            }
+            const result = await sendLocationToBackend(points);
+            console.log('规划的路径点:', result);
+            // 创建折线
+            polyline = new AMap.Polyline({
+                path: result, // 设置折线经过的坐标点数组
+                strokeColor: "#FF33FF", // 线颜色
+                strokeOpacity: 1, // 线透明度
+                strokeWeight: 3, // 线宽
+                strokeStyle: "solid", // 线样式
+                strokeDasharray: [10, 5], // 自定义线段样式，格式为[线段长度, 空白长度]
+                lineJoin: 'round', // 折线拐点连接处样式
+                isOutline: false // 是否绘制边线外轮廓
+            });
+            // 将折线添加到地图上
+            map.add(polyline);
+        });
+
+        async function sendLocationToBackend(points) {
+            const jsonData = {
+                pts: points
+            };
+            try {
+                const response = await fetch('http://localhost:8000/location/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(jsonData)
+                });
+                const data = await response.json();
+                console.log('Success:', data);
+                return data;
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        };
+
+    </script>
+</body>
+
+</html>
