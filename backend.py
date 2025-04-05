@@ -8,24 +8,53 @@
 4pro. firework和sparks涉及到的路段不用距离做衡量,而是调用高德api获取的该段的平均speed,距离/speed的时间作为权重。
 5. 可视化,可以做一个html网页,支持点击输入起点终点,输出路径。
 '''
-
+# TODO: 路径和路况也可以输出
 import osmnx as ox
 from networkx import DiGraph, MultiDiGraph, is_isolate
 import numpy as np
 import requests
+import time
 import folium
 import json
 from IPython.display import display, HTML
 import networkx as nx
 from shapely.geometry import LineString, Point
+from collections import deque
 import matplotlib.pyplot as plt
 import random
+from flask import Flask, request, jsonify
 
 def build_road_network(place_name="海淀区, 北京", simplify=True):
     """构建带权有向路网"""
     # 从OSM下载原始路网
-    G = ox.graph_from_place(place_name, network_type='drive', simplify=simplify)
+    G = ox.graph_from_place(place_name, network_type='drive', simplify=simplify)  # MultiDiGraph
+
+    # 排除掉 residential 属性的道路
+    edges_to_keep = [
+        (u, v, k) for u, v, k, data in G.edges(keys=True, data=True)
+        if "highway" in data and not (
+            isinstance(data["highway"], str) and data["highway"] == "residential" or
+            isinstance(data["highway"], list) and "residential" in data["highway"]
+        )
+    ]
+    G_major = G.edge_subgraph(edges_to_keep).copy()
+
+    # 检查并移除孤立节点
+    isolated_nodes = [node for node in G_major.nodes if is_isolate(G_major, node)]
+    if isolated_nodes:
+        print(f"发现孤立节点：{len(isolated_nodes)} 个，正在移除...")
+        G_major.remove_nodes_from(isolated_nodes)
+    else:
+        print("未发现孤立节点")
+
+    # 转换为有向图
+    digraph = nx.DiGraph(G_major)
+    return G_major, digraph
     
+
+
+
+
     # 转换为带权有向图
     # weighted_G = DiGraph()
     # weighted_G = MultiDiGraph()
@@ -40,9 +69,8 @@ def build_road_network(place_name="海淀区, 北京", simplify=True):
     #     length = data.get('length', 100)  # 默认长度100米
     #     weighted_G.add_edge(u, v, weight=length)
         
-    #     # 处理双向道路
-    #     if not data.get('oneway', False):
-    #         weighted_G.add_edge(v, u, weight=length)
+    #     # 要处理单向道路吗
+        
     
     # # 检查并移除孤立节点
     # isolated_nodes = [node for node in weighted_G.nodes if is_isolate(weighted_G, node)]
@@ -52,7 +80,59 @@ def build_road_network(place_name="海淀区, 北京", simplify=True):
     # else:
     #     print("未发现孤立节点")
     
-    return G
+    # return G_major, digraph
+
+def get_path_road_names(G, paths):
+    """获取路径经过的所有道路名称"""
+    road_nodes = {}
+    
+    for i in range(len(paths) - 1):
+        u, v = paths[i], paths[i + 1]
+
+        # 获取 u 与 v 之间的所有边的数据
+        edges = G.get_edge_data(u, v)
+        if edges is None:
+            print(f"节点 {u} 和 {v} 之间没有边。")
+            continue
+
+        # 遍历所有边
+        for key, edge_data in edges.items():
+            # 获取边的名称
+            name = edge_data.get('name', None)
+            if name:
+                # 如果名称是列表，逐个处理
+                if isinstance(name, list):
+                    for n in name:
+                        if n not in road_nodes:
+                            road_nodes[n] = []
+                        if u not in road_nodes[n]:
+                            road_nodes[n].append(u)
+                        if v not in road_nodes[n]:
+                            road_nodes[n].append(v)
+                else:
+                    if name not in road_nodes:
+                        road_nodes[name] = []
+                    if u not in road_nodes[name]:
+                        road_nodes[name].append(u)
+                    if v not in road_nodes[name]:
+                        road_nodes[name].append(v)
+    
+    return road_nodes
+
+def filter_major_roads(G):
+    # 将图转换为 GeoDataFrame
+    gdf_nodes, gdf_edges = ox.graph_to_gdfs(G)
+
+    # 主要道路类别
+    major_highways = {"motorway", "trunk", "primary", "secondary", "tertiary"}
+
+    # 过滤边，保留主要道路
+    gdf_edges_filtered = gdf_edges[gdf_edges["highway"].apply(lambda x: isinstance(x, list) and any(h in major_highways for h in x) or x in major_highways)]
+
+    # 重新构建图
+    G_filtered = ox.graph_from_gdfs(gdf_nodes, gdf_edges_filtered)
+    
+    return G_filtered
 
 def locate_nodes(network, origins, destinations):
     """将经纬度坐标映射到最近路网节点"""
@@ -131,7 +211,7 @@ def find_path_on_network(G, start_node, end_node, polyline):
             segment = nx.shortest_path(G, 
                                       source=polyline_nodes[i], 
                                       target=polyline_nodes[i+1], 
-                                      weight='weight')
+                                      weight='length')
             # 添加路径但避免重复节点
             if path and path[-1] == segment[0]:
                 path.extend(segment[1:])
@@ -143,52 +223,184 @@ def find_path_on_network(G, start_node, end_node, polyline):
     return path
 
 
-def generate_sparks(G, firework_path, num_sparks=5, deviation=0.3):
-    """根据firework路径生成多个spark路径"""
+def generate_sparks(G, firework_path, num_sparks=5, min_distance=5, max_distance=15, min_angle=30, max_angle=150):
     sparks = []
     
-    # 获取firework路径的节点总数
-    path_length = len(firework_path)
+    # 计算节点之间的地理距离
+    def calculate_distance(node1, node2):
+        lat1, lon1 = G.nodes[node1]['y'], G.nodes[node1]['x']
+        lat2, lon2 = G.nodes[node2]['y'], G.nodes[node2]['x']
+        return ox.distance.great_circle(lat1, lon1, lat2, lon2)
     
-    for _ in range(num_sparks):
-        # 随机选择一个分叉点和重新加入点
-        fork_idx = random.randint(int(path_length * 0.1), int(path_length * 0.4))
-        rejoin_idx = random.randint(fork_idx + int(path_length * 0.1), min(fork_idx + int(path_length * 0.5), path_length - 1))
+    # 计算两条边的夹角
+    def calculate_angle(G, branch_node, nextnode, startnode, endnode):
+        # 获取节点坐标
+        lat1, lon1 = G.nodes[branch_node]['y'], G.nodes[branch_node]['x']
+        lat2, lon2 = G.nodes[nextnode]['y'], G.nodes[nextnode]['x']
+        lat3, lon3 = G.nodes[startnode]['y'], G.nodes[startnode]['x']
+        lat4, lon4 = G.nodes[endnode]['y'], G.nodes[endnode]['x']
+
+        # 计算向量
+        vec1 = np.array([lon2 - lon1, lat2 - lat1])  # branch_node -> nextnode 向量
+        vec2 = np.array([lon4 - lon3, lat4 - lat3])  # startnode -> endnode 向量
+
+        # 计算角度
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+
+        cos_angle = dot_product / (norm1 * norm2)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)  # 避免计算误差
+
+        angle_rad = np.arccos(cos_angle)
+        angle_deg = np.degrees(angle_rad)
+
+        return angle_deg
+    def adaptive_distance_range(firework_path, branch_point_idx, min_distance_max, max_distance_max, decay_factor=0.05):
+        """
+        根据 branch_point_idx 调整 min_distance 和 max_distance，使其随 index 增大而递减
+
+        :param firework_path: 路径点列表
+        :param branch_point_idx: 分叉点在路径中的索引
+        :param min_distance_max: 初始最小距离
+        :param max_distance_max: 初始最大距离
+        :param decay_factor: 衰减系数，控制 min/max_distance 的递减速度
+        :return: 计算后的 (min_distance, max_distance)
+        """
+        total_points = len(firework_path)  # 路径总点数
+        norm_idx = branch_point_idx / total_points  # 归一化索引 (0~1)
+
+        # **线性衰减**
+        # min_distance = min_distance_max * (1 - norm_idx)
+        # max_distance = max_distance_max * (1 - norm_idx)
+
+        # **指数衰减**（减少过快时可以调整 decay_factor）
+        min_distance = min_distance_max * np.exp(-decay_factor * branch_point_idx)
+        max_distance = max_distance_max * np.exp(-decay_factor * branch_point_idx)
+
+        return max(min_distance, 0), max(max_distance, 0)  # 避免负值
+    # 找出一定距离范围内的节点
+    def find_nodes_in_distance_range(center_node, min_dist, max_dist):
+        candidates = []
+        center_point = (G.nodes[center_node]['y'], G.nodes[center_node]['x'])
         
-        fork_node = firework_path[fork_idx]
-        rejoin_node = firework_path[rejoin_idx]
+        # 使用NetworkX的ego_graph来获得一定范围内的节点
+        radius_graph_max = nx.ego_graph(G, center_node, radius=max_dist)  # 粗略估计，后面会精确计算
+        radius_graph_min = nx.ego_graph(G, center_node, radius=min_dist)
+
+        for node in set(radius_graph_max.nodes()) - set(radius_graph_min.nodes()):
+            # if node != center_node:
+            #     dist = calculate_distance(center_node, node)
+            #     if min_dist <= dist <= max_dist:
+            candidates.append(node)
         
-        # 找到从分叉点出发的所有边
-        neighbors = list(G.neighbors(fork_node))
+        return candidates
+    
+    for i in range(num_sparks):
+        # 随机选择是从起点出发还是从终点出发
+        # if np.random.rand() > 0.5:
+        # 从起点出发
+        source = firework_path[0]
+        target = firework_path[-1]
+        direction = 'forward'
+        # else:
+        #     # 从终点出发
+        #     source = firework_path[-1]
+        #     target = firework_path[0]
+        #     direction = 'backward'
         
-        # 从邻居中排除已经在firework路径中的下一个节点
-        if fork_idx + 1 < len(firework_path):
-            next_node_in_path = firework_path[fork_idx + 1]
-            if next_node_in_path in neighbors:
-                neighbors.remove(next_node_in_path)
+        # 从路径中随机选择一个节点作为分叉点
+        if i < 10:
+            branch_point_idx = 0
+        elif i < 20:
+            branch_point_idx = len(firework_path) - 1
+        else:
+            if len(firework_path) > 2:
+                branch_point_idx = np.random.randint(0, len(firework_path) - 1)
+            else:
+                branch_point_idx = 0
         
-        if not neighbors:
+        branch_point = firework_path[branch_point_idx]
+        
+        # 如果不是起点，获取前一个节点；如果是起点，使用下一个节点
+        # if branch_point_idx > 0:
+        #     prev_node = firework_path[branch_point_idx - 1]
+        # else:
+        #     prev_node = firework_path[branch_point_idx + 1]
+
+        # 我需要找next_node
+        # if branch_point_idx < len(firework_path) - 1 and direction == 'forward':
+        #     next_node = firework_path[branch_point_idx + 1]
+        # elif branch_point_idx > 0 and direction == 'backward':
+        #     next_node = firework_path[branch_point_idx - 1]
+        # elif branch_point_idx == 0:
+        #     next_node = firework_path[branch_point_idx + 1]
+        # else:
+        #     next_node = firework_path[branch_point_idx - 1]
+        
+        # 获取符合距离条件的候选节点
+        min_distance_, max_distance_ = adaptive_distance_range(firework_path, branch_point_idx, min_distance, max_distance)
+        print(f"第 {i+1} 条spark: 分叉点索引 {branch_point_idx}, 最小距离 {min_distance_:.2f}, 最大距离 {max_distance_:.2f}")
+        candidates = find_nodes_in_distance_range(branch_point, min_distance_, max_distance_)
+        
+        if not candidates:
+            print(f"没有找到符合条件的候选节点，跳过第 {i+1} 条spark")
             continue
         
-        # 随机选择一个偏离方向
-        deviation_node = random.choice(neighbors)
+        # 筛选符合角度条件的候选节点
+        valid_candidates = []
+        for node in candidates:
+            angle = calculate_angle(G, branch_point, node, source, target)
+            if 0 <= angle <= 60:
+                # print(f"节点 {node} 的角度为 {angle:.2f}°，符合条件")
+                valid_candidates.append(node)
         
-        # 尝试找到一条从偏离点到重新加入点的路径
-        try:
-            # 先找到从fork_node到deviation_node的路径
-            deviation_path = [fork_node, deviation_node]
-            
-            # 再找到从deviation_node到rejoin_node的路径
-            rejoin_path = nx.shortest_path(G, source=deviation_node, target=rejoin_node, weight='weight')
-            
-            # 组合路径：从起点到分叉点 + 偏离路径 + 从重新加入点到终点
-            spark_path = firework_path[:fork_idx] + deviation_path[1:] + rejoin_path[1:] + firework_path[rejoin_idx+1:]
-            
-            sparks.append(spark_path)
-        except nx.NetworkXNoPath:
-            # 如果找不到路径，跳过这次尝试
-            print(f"无法找到从 {deviation_node} 到 {rejoin_node} 的路径，跳过这条spark")
+        if not valid_candidates:
             continue
+        
+        # 创建一个候选节点的副本，用于随机选择
+        remaining_candidates = valid_candidates[:]
+
+        while remaining_candidates:
+            # 随机选择一个符合条件的新节点
+            new_node = random.choice(remaining_candidates)
+            remaining_candidates.remove(new_node)  # 从候选列表中移除已尝试的节点
+
+            # 寻找从分叉点到新节点的路径
+            try:
+                branch_path = nx.shortest_path(G, branch_point, new_node, weight='length')
+            except nx.NetworkXNoPath:
+                continue  # 如果没有路径，尝试下一个节点
+
+            # 寻找从新节点到目标的路径
+            try:
+                remaining_path = nx.shortest_path(G, new_node, target, weight='length')
+            except nx.NetworkXNoPath:
+                continue  # 如果没有路径，尝试下一个节点
+
+            # 检查有没有走回头路
+            remaining_slice = remaining_path[1:5] if len(remaining_path) > 5 else remaining_path[1:]
+            if set(branch_path[1:-1]) & set(remaining_slice):
+                # 如果路径有交集，尝试下一个节点
+                continue
+
+            # 如果找到符合条件的路径，退出循环
+            break
+        else:
+            # 如果所有候选节点都尝试过且没有找到符合条件的路径
+            print(f"无法找到符合条件的路径，跳过第 {i+1} 条 spark")
+            continue
+
+        # 构建完整路径
+        if direction == 'forward':
+            # 分叉点前面的路径 + 分叉路径 + 剩余路径(除去新节点，避免重复)
+            new_path = firework_path[:branch_point_idx+1] + branch_path[1:] + remaining_path[1:]
+        else:
+            # 反向：从终点到分叉点的路径 + 分叉路径 + 从新节点到起点的路径(除去新节点)
+            new_path = firework_path[:branch_point_idx+1] + branch_path[1:] + remaining_path[1:]
+            new_path.reverse()  # 需要反转以保持从起点到终点的顺序
+            
+        sparks.append(new_path)
     
     return sparks
 
@@ -211,12 +423,12 @@ def calculate_path_cost(G, path, use_speed=False, amap_key=None):
                 avg_speed = get_segment_speed(amap_key, (u_lon, u_lat), (v_lon, v_lat))
                 
                 # 计算时间成本 = 距离/速度
-                distance = G[u][v]['weight']
+                distance = G[u][v][0]['length']
                 time_cost = distance / max(avg_speed, 1)  # 避免除以零
                 total_cost += time_cost
             else:
                 # 使用距离作为权重
-                total_cost += G[u][v]['weight']
+                total_cost += G[u][v][0]['length']
         else:
             # 如果边不存在，给予一个很大的惩罚
             total_cost += 10000
@@ -252,23 +464,19 @@ def get_segment_speed(amap_key, origin, destination):
     except:
         return 10  # 请求失败时的默认速度
 
-def find_best_path(G, origin, destination, amap_key, use_speed=False, num_sparks=5):
+def find_best_path(G, diG, origin, destination, amap_key, use_speed=False, num_sparks=10, really_use_api=False):
     """找到从起点到终点的最佳路径"""
     # 1. 找到OSM网络中最近的起点和终点节点
     start_node, end_node = locate_nodes(G, [origin], [destination])
-    
+    # 增加两个节点到路网并分别连接他们和startnode，endnode
+
+
+
     # 2. 获取高德API的基本路径
     amap_routes = get_amap_routes(origin, destination, amap_key)
     
     if not amap_routes:
         print("无法从高德API获取路径，使用OSM默认最短路径")
-        try:
-            default_path = nx.shortest_path(G, start_node, end_node, weight='weight')
-            print(default_path)
-            return default_path, G, None
-        except nx.NetworkXNoPath:
-            print("无法找到从起点到终点的路径")
-            return None, G, None
     
     # 3. 将高德路径转换为OSM网络上的路径（firework）
     fireworks = []
@@ -280,64 +488,186 @@ def find_best_path(G, origin, destination, amap_key, use_speed=False, num_sparks
     if not fireworks:
         print("无法将高德路径映射到OSM网络上，使用OSM默认最短路径")
         try:
-            default_path = nx.shortest_path(G, start_node, end_node, weight='weight')
-            return default_path, G, None
+            default_path = nx.shortest_path(G, start_node, end_node, weight='length')
+            print(default_path)
+            fireworks.append(default_path)
+            # return default_path, G, None
         except nx.NetworkXNoPath:
             print("无法找到从起点到终点的路径")
-            return None, G, None
+            return None, G, None, None
     
     # 4. 生成多个spark路径
     all_paths = []
     for firework in fireworks:
         all_paths.append(firework)
-        sparks = generate_sparks(G, firework, num_sparks)
+        sparks = generate_sparks(diG, firework, num_sparks)
         print(f"生成 {len(sparks)} 条spark路径")
         all_paths.extend(sparks)
     
     # 5. 计算所有路径的成本并找到最佳路径
     best_path = None
     lowest_cost = float('inf')
-    
-    for path in all_paths:
-        cost = calculate_path_cost(G, path, use_speed, amap_key)
-        if cost < lowest_cost:
-            lowest_cost = cost
-            best_path = path
-    
+    road_info_dict = {}
+    if not use_speed:
+        for path in all_paths:
+            cost = calculate_path_cost(G, path, use_speed, amap_key)
+            if cost < lowest_cost:
+                lowest_cost = cost
+                best_path = path
+    else:
+        # highway 类型对应的默认速度（单位：km/h）
+        highway_default_speeds = {
+            "motorway": 80,           # 高速公路，降低到 80 km/h
+            "motorway_link": 50,      # 高速公路连接路段，降低到 50 km/h
+            "trunk": 70,              # 主干道，降低到 70 km/h
+            "trunk_link": 50,         # 主干道连接路段，降低到 50 km/h
+            "primary": 50,            # 主要道路，降低到 50 km/h
+            "primary_link": 40,       # 主要道路连接路段，降低到 40 km/h
+            "secondary": 40,          # 次要道路，降低到 40 km/h
+            "secondary_link": 30,     # 次要道路连接路段，降低到 30 km/h
+            "tertiary": 30,           # 第三级道路，降低到 30 km/h
+            "tertiary_link": 20,      # 第三级道路连接路段，降低到 20 km/h
+            "unclassified": 20,       # 未分类道路，降低到 20 km/h
+            "residential": 20,        # 居民区道路，降低到 20 km/h
+            "living_street": 10,      # 生活街区，保持 10 km/h
+            "road": 15,               # 普通道路，降低到 15 km/h
+            "scramble": 5,            # 混合区域，保持 5 km/h
+        }
+        all_paths_road_names = []
+
+        road_nodes_all = {}
+        for path in all_paths:
+            road_nodes = get_path_road_names(G, path)
+            # 合并入road_nodes_all
+            for road_name, nodes in road_nodes.items():
+                if road_name in road_nodes_all:
+                    road_nodes_all[road_name].extend(nodes)
+                else:
+                    road_nodes_all[road_name] = nodes
+            road_names = list(road_nodes.keys())
+            all_paths_road_names.append(road_names)
+
+        # set一下road_nodes_all的value
+        for road_name, nodes in road_nodes_all.items():
+            road_nodes_all[road_name] = list(set(nodes))
+
+        unique_road_names = set(road_name for road_names in all_paths_road_names for road_name in road_names)
+        print(f"所有路径经过的道路名称：{unique_road_names}")
+
+        if really_use_api:
+            ak = "ZJcr2bfcgSCSxSDw2HdpodSPrC2CtvDd"
+            city = "北京市"
+            # road_info_dict = {}
+
+            for road_name in unique_road_names:
+                params = {
+                    "road_name": road_name,
+                    "city": city,
+                    "ak": ak,
+                }
+                response = requests.get(url="https://api.map.baidu.com/traffic/v1/road", params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"查询道路: {road_name}, 返回数据: {data}")  # 输出API响应数据
+                    
+                    if data.get("status") == 0:
+                        description = data.get("description", "")
+                        road_traffic = data.get("road_traffic", [])
+                        if road_traffic:
+                            congestion_sections = road_traffic[0].get("congestion_sections", [])
+                            if congestion_sections:
+                                avg_speed = sum(section.get("speed", 0) for section in congestion_sections) / len(congestion_sections)
+                                road_info_dict[road_name] = {"description": description, "speed": avg_speed, "node_coo": 
+                                                             [(G.nodes[node].get('y', 'Unknown'), G.nodes[node].get('x', 'Unknown')) for node in road_nodes_all[road_name]]}
+                            else:
+                                print(f"没有拥堵段数据: {road_name}")
+                        else:
+                            print(f"没有路段信息: {road_name}")
+                    else:
+                        print(f"API返回状态不为0, 无法获取 {road_name} 的数据")
+                else:
+                    print(f"API请求失败: {road_name}")
+                time.sleep(1)  # 避免过于频繁的请求
+
+            # 保存 road_info_dict 到本地文件
+            with open('road_info_dict.json', 'w', encoding='utf-8') as f:
+                json.dump(road_info_dict, f, ensure_ascii=False, indent=4)
+        else:
+            # 从本地文件加载 road_info_dict
+            with open('road_info_dict.json', 'r', encoding='utf-8') as f:
+                road_info_dict = json.load(f)
+       
+        path_costs = []
+
+        for path, road_names in zip(all_paths, all_paths_road_names):
+            total_time = 0.0
+            idx = 0
+            lengths = []
+            times = []
+            previous_name = None    
+
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                edge = G.get_edge_data(u, v)
+                for key, edge_data in edge.items():
+                    name = edge_data.get('name', None)
+                    length = edge_data.get('length', 0)  # 边的长度，单位：米
+                    if isinstance(name, list):
+                        name = name[0] if name else None  # 如果列表为空，设置为 None
+                    if isinstance(length, list):
+                        length = length[0] if length else 0
+                    # 如过name是None，follow上一个name
+                    if name is None:
+                        name = previous_name
+                    else:
+                        previous_name = name
+                    # print(f"当前道路名称: {name}")
+                    if name not in road_info_dict or name is None:
+                        highway = edge_data.get('highway', None)
+                        if isinstance(highway, list):
+                            highway = highway[0] if highway else None
+                        
+                        speed = highway_default_speeds.get(highway)  # 默认速度20km/h
+                        time_ = length / (speed * 1000 / 3600)  # 转换为秒
+                        times.append(time_)
+                    else:
+                        # 如果有速度信息，使用速度计算时间
+                        if road_info_dict[name]["speed"] > 0:
+                            time_ = length / (road_info_dict[name]["speed"] * 1000 / 3600)
+                            times.append(time_)
+            #         lengths.append(length)
+            #         new_idx = road_names.index(name) if name in road_names else -1
+            #         if new_idx == idx + 1:
+            #             idx = new_idx
+            #             sum_length = sum(lengths[:-1])
+            #             lengths = [lengths[-1]]
+            #             # 判断是否有速度信息
+            #             if road_names[idx-1] in road_info_dict:
+            #                 speed = road_info_dict[road_names[idx-1]]["speed"] * 1000 / 3600
+            #                 if speed > 0:
+            #                     time_ = sum_length / speed
+            #                     times.append(time_)
+                        
+            # # 计算最后一段道路的时间
+            # if lengths:
+            #     sum_length = sum(lengths)
+            #     if road_names[idx] in road_info_dict:
+            #         speed = road_info_dict[road_names[idx]]["speed"] * 1000 / 3600  # 转换为米/秒
+            #         if speed > 0:
+            #             time_ = sum_length / speed
+            #             times.append(time_)
+            total_time = sum(times)
+            path_costs.append(total_time)
+            if total_time < lowest_cost:
+                lowest_cost = total_time
+                best_path = path
+        # print(f"所有路径的平均时间：{path_costs}")
+    # 6. 输出结果    
     print(f"共计算了 {len(all_paths)} 条路径，找到成本为 {lowest_cost} 的最佳路径")
     
-    return best_path, G, fireworks
+    return best_path, G, fireworks, all_paths, road_info_dict
 
-def visualize_paths(G, best_path, fireworks=None, origin=None, destination=None):
-    """可视化路径"""
-    fig, ax = plt.subplots(figsize=(15, 15))
-    
-    # 绘制基本路网
-    ox.plot_graph(G, ax=ax, node_size=0, edge_linewidth=0.5, edge_color='grey')
-    
-    # 绘制高德提供的基本路径（fireworks）
-    if fireworks:
-        for i, firework in enumerate(fireworks):
-            edges = [(firework[i], firework[i+1]) for i in range(len(firework)-1)]
-            color = 'blue'
-            ox.plot_graph_routes(G, firework, ax=ax, route_color=color, route_linewidth=1, route_alpha=0.5)
-    
-    # 绘制最优路径
-    if best_path:
-        ox.plot_graph_route(G, best_path, ax=ax, route_color='red', route_linewidth=2)
-    
-    # 标记起点和终点
-    if origin and destination:
-        # 绘制起点
-        ax.scatter(origin[0], origin[1], c='green', s=100, marker='^', zorder=5)
-        ax.annotate('Origin', (origin[0], origin[1]), fontsize=12)
-        
-        # 绘制终点
-        ax.scatter(destination[0], destination[1], c='red', s=100, marker='*', zorder=5)
-        ax.annotate('Destination', (destination[0], destination[1]), fontsize=12)
-    
-    plt.tight_layout()
-    return fig
+
 
 def create_interactive_map(G, best_path, fireworks=None, origin=None, destination=None):
     """创建交互式地图"""
@@ -399,337 +729,39 @@ def create_interactive_map(G, best_path, fireworks=None, origin=None, destinatio
     
     return m
 
-def create_route_planner_html():
-    """创建一个简单的HTML路径规划器"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>OSM & AMap Route Planner</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
-        <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
-        <style>
-            body {
-                margin: 0;
-                padding: 0;
-                font-family: Arial, sans-serif;
-            }
-            #container {
-                display: flex;
-                height: 100vh;
-            }
-            #sidebar {
-                width: 300px;
-                padding: 20px;
-                background-color: #f4f4f4;
-                overflow-y: auto;
-            }
-            #map {
-                flex-grow: 1;
-                height: 100%;
-            }
-            .input-group {
-                margin-bottom: 15px;
-            }
-            label {
-                display: block;
-                margin-bottom: 5px;
-            }
-            input, select, button {
-                width: 100%;
-                padding: 8px;
-                box-sizing: border-box;
-            }
-            button {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                cursor: pointer;
-            }
-            button:hover {
-                background-color: #45a049;
-            }
-            .path-info {
-                margin-top: 20px;
-                padding: 10px;
-                background-color: #e9e9e9;
-                border-radius: 5px;
-            }
-        </style>
-    </head>
-    <body>
-        <div id="container">
-            <div id="sidebar">
-                <h2>路径规划</h2>
-                <div class="input-group">
-                    <label for="place">地区:</label>
-                    <input type="text" id="place" value="海淀区, 北京">
-                </div>
-                <div class="input-group">
-                    <label for="origin-lng">起点经度:</label>
-                    <input type="text" id="origin-lng" placeholder="116.3452">
-                </div>
-                <div class="input-group">
-                    <label for="origin-lat">起点纬度:</label>
-                    <input type="text" id="origin-lat" placeholder="39.9789">
-                </div>
-                <div class="input-group">
-                    <label for="dest-lng">终点经度:</label>
-                    <input type="text" id="dest-lng" placeholder="116.4345">
-                </div>
-                <div class="input-group">
-                    <label for="dest-lat">终点纬度:</label>
-                    <input type="text" id="dest-lat" placeholder="39.9012">
-                </div>
-                <div class="input-group">
-                    <label for="amap-key">高德地图 API Key:</label>
-                    <input type="text" id="amap-key" placeholder="输入你的高德API Key">
-                </div>
-                <div class="input-group">
-                    <label for="use-speed">使用速度作为权重:</label>
-                    <select id="use-speed">
-                        <option value="false">否 (使用距离)</option>
-                        <option value="true">是 (使用时间)</option>
-                    </select>
-                </div>
-                <div class="input-group">
-                    <label for="num-sparks">Spark 数量:</label>
-                    <input type="number" id="num-sparks" value="5" min="1" max="20">
-                </div>
-                <button id="plan-route">规划路径</button>
-                <button id="pick-on-map">在地图上选择点</button>
-                
-                <div class="path-info" id="path-info" style="display: none;">
-                    <h3>路径信息</h3>
-                    <div id="path-details"></div>
-                </div>
-            </div>
-            <div id="map"></div>
-        </div>
-
-        <script>
-            // 初始化地图
-            var map = L.map('map').setView([39.9042, 116.4074], 12);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            }).addTo(map);
-            
-            // 用于存储标记和路径
-            var markers = [];
-            var paths = [];
-            var pickingMode = false;
-            var pickingOrigin = true;
-            
-            // 点击地图选择点
-            document.getElementById('pick-on-map').addEventListener('click', function() {
-                pickingMode = true;
-                pickingOrigin = true;
-                alert('点击地图选择起点');
-            });
-            
-            map.on('click', function(e) {
-                if (!pickingMode) return;
-                
-                var lat = e.latlng.lat;
-                var lng = e.latlng.lng;
-                
-                if (pickingOrigin) {
-                    document.getElementById('origin-lat').value = lat;
-                    document.getElementById('origin-lng').value = lng;
-                    alert('现在点击地图选择终点');
-                    pickingOrigin = false;
-                } else {
-                    document.getElementById('dest-lat').value = lat;
-                    document.getElementById('dest-lng').value = lng;
-                    pickingMode = false;
-                }
-            });
-            
-            // 规划路径
-            document.getElementById('plan-route').addEventListener('click', function() {
-                var place = document.getElementById('place').value;
-                var originLng = document.getElementById('origin-lng').value;
-                var originLat = document.getElementById('origin-lat').value;
-                var destLng = document.getElementById('dest-lng').value;
-                var destLat = document.getElementById('dest-lat').value;
-                var amapKey = document.getElementById('amap-key').value;
-                var useSpeed = document.getElementById('use-speed').value === 'true';
-                var numSparks = parseInt(document.getElementById('num-sparks').value);
-                
-                // 清除已有标记和路径
-                clearMap();
-                
-                // 添加起点和终点标记
-                addMarker([originLat, originLng], '起点', 'green');
-                addMarker([destLat, destLng], '终点', 'red');
-                
-                // 设置地图视图
-                map.fitBounds([
-                    [originLat, originLng],
-                    [destLat, destLng]
-                ]);
-                
-                // 模拟路径规划
-                simulateRoutePlanning(place, originLng, originLat, destLng, destLat, amapKey, useSpeed, numSparks);
-            });
-            
-            function clearMap() {
-                // 清除标记
-                markers.forEach(function(marker) {
-                    map.removeLayer(marker);
-                });
-                markers = [];
-                
-                // 清除路径
-                paths.forEach(function(path) {
-                    map.removeLayer(path);
-                });
-                paths = [];
-            }
-            
-            function addMarker(latLng, title, color) {
-                var icon = L.divIcon({
-                    className: 'custom-div-icon',
-                    html: `<div style="background-color: ${color}; width: 12px; height: 12px; border-radius: 50%;"></div>`,
-                    iconSize: [12, 12],
-                    iconAnchor: [6, 6]
-                });
-                
-                var marker = L.marker(latLng, {icon: icon}).addTo(map);
-                marker.bindPopup(title);
-                markers.push(marker);
-                return marker;
-            }
-            
-            function simulateRoutePlanning(place, originLng, originLat, destLng, destLat, amapKey, useSpeed, numSparks) {
-                // 这里应该是调用后端API进行真实路径规划
-                // 由于是前端示例，我们只模拟显示一些路径
-                
-                // 显示加载状态
-                document.getElementById('path-details').innerHTML = '正在计算路径...';
-                document.getElementById('path-info').style.display = 'block';
-                
-                // 模拟延迟
-                setTimeout(function() {
-                    // 模拟firework路径（蓝色）
-                    var fireworkPath = generateSimulatedPath([originLat, originLng], [destLat, destLng], 0.001);
-                    var firework = L.polyline(fireworkPath, {color: 'blue', weight: 3, opacity: 0.5}).addTo(map);
-                    paths.push(firework);
-                    
-                    // 模拟生成sparks路径
-                    for (var i = 0; i < numSparks; i++) {
-                        var sparkPath = generateSimulatedPath([originLat, originLng], [destLat, destLng], 0.003);
-                        var spark = L.polyline(sparkPath, {color: 'purple', weight: 2, opacity: 0.3}).addTo(map);
-                        paths.push(spark);
-                    }
-                    
-                    // 模拟最优路径（红色）
-                    var bestPath = generateSimulatedPath([originLat, originLng], [destLat, destLng], 0.002);
-                    var best = L.polyline(bestPath, {color: 'red', weight: 4}).addTo(map);
-                    paths.push(best);
-                    
-                    // 更新路径信息
-                    var distance = calculateDistance(bestPath).toFixed(2);
-                    document.getElementById('path-details').innerHTML = `
-                        <p>起点: (${originLat}, ${originLng})</p>
-                        <p>终点: (${destLat}, ${destLng})</p>
-                        <p>总距离: ${distance} km</p>
-                        <p>路径类型: ${useSpeed ? '基于时间' : '基于距离'}</p>
-                        <p>生成的Spark数: ${numSparks}</p>
-                    `;
-                }, 1000);
-            }
-            
-            function generateSimulatedPath(start, end, deviation) {
-                var path = [start];
-                var numPoints = 5 + Math.floor(Math.random() * 5);
-                
-                for (var i = 1; i < numPoints; i++) {
-                    var ratio = i / numPoints;
-                    var lat = start[0] * (1 - ratio) + end[0] * ratio;
-                    var lng = start[1] * (1 - ratio) + end[1] * ratio;
-                    
-                    // 添加随机偏移
-                    lat += (Math.random() - 0.5) * deviation;
-                    lng += (Math.random() - 0.5) * deviation;
-                    
-                    path.push([lat, lng]);
-                }
-                
-                path.push(end);
-                return path;
-            }
-            
-            function calculateDistance(path) {
-                var distance = 0;
-                for (var i = 0; i < path.length - 1; i++) {
-                    distance += getDistanceFromLatLonInKm(path[i][0], path[i][1], path[i+1][0], path[i+1][1]);
-                }
-                return distance;
-            }
-            
-            function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
-                var R = 6371; // 地球半径（千米）
-                var dLat = deg2rad(lat2 - lat1);
-                var dLon = deg2rad(lon2 - lon1); 
-                var a = 
-                    Math.sin(dLat/2) * Math.sin(dLat/2) +
-                    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * 
-                    Math.sin(dLon/2) * Math.sin(dLon/2); 
-                var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
-                var d = R * c; // 距离（千米）
-                return d;
-            }
-            
-            function deg2rad(deg) {
-                return deg * (Math.PI/180)
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return html_content
-
 # 主函数
 def main():
     # 设置高德地图 API Key
-    amap_key = "20eab95559788e3ad3f71cf404c60821"  # 需要替换为实际的API Key
+    amap_key = "20eab95559788e3ad3f71cf404c60821h"  # 需要替换为实际的API Key
     
     # 构建路网
     print("正在构建路网...")
-    G = build_road_network("海淀区, 北京")
+    G, diG = build_road_network("海淀区, 北京", simplify=True)
     print(f"路网构建完成，包含 {len(G.nodes)} 个节点和 {len(G.edges)} 条边")
     
     # 设置示例起点和终点坐标（经度，纬度）
     origin = (116.34899139404298, 39.95976154261228)  # 北京邮电大学西门
-    # destination = (116.315681,39.990138)   # 北京大学东南门
-    # destination = (116.332148,39.994847)  # 清华园
     destination = (116.30986976728312, 39.99037781712655)  
+    # origin=(39.93093245403986, 116.3668441772461)
+    # destination=(39.93942226632577, 116.43851280212404)
     # 查找最佳路径
     print("正在计算最佳路径...")
-    best_path, updated_G, fireworks = find_best_path(G, origin, destination, amap_key, use_speed=True, num_sparks=5)
+    best_path, updated_G, fireworks, all_paths, road_info_dict = find_best_path(G, diG, origin, destination, amap_key, use_speed=True, num_sparks=150, really_use_api=False)
     
     if best_path:
         print("找到最佳路径！")
         
-        # 可视化路径
-        print("生成可视化结果...")
-        fig = visualize_paths(updated_G, best_path, fireworks, origin, destination)
-        plt.savefig("best_route.png")
-        print("静态可视化结果已保存为 'best_route.png'")
+        # # 可视化路径
+        # print("生成可视化结果...")
+        # fig = visualize_paths(updated_G, best_path, fireworks, origin, destination)
+        # plt.savefig("best_route.png")wegame
+        # print("静态可视化结果已保存为 'best_route.png'")
         
         # 创建交互式地图
-        m = create_interactive_map(updated_G, best_path, fireworks, origin, destination)
+        m = create_interactive_map(updated_G, best_path, all_paths, origin, destination)
         m.save("interactive_map.html")
         print("交互式地图已保存为 'interactive_map.html'")
         
-        # 创建路径规划器HTML
-        html_content = create_route_planner_html()
-        with open("route_planner.html", "w", encoding="utf-8") as f:
-            f.write(html_content)
-        print("路径规划器已保存为 'route_planner.html'")
     else:
         print("无法找到从起点到终点的路径")
 
@@ -845,3 +877,34 @@ if __name__ == "__main__":
 #     # 简单的欧氏距离（经纬度差值的平方和的平方根）
 #     # 在小范围内可以作为近似
 #     return np.sqrt((lng1 - lng2)**2 + (lat1 - lat2)**2)
+
+# def visualize_paths(G, best_path, fireworks=None, origin=None, destination=None):
+#     """可视化路径"""
+#     fig, ax = plt.subplots(figsize=(15, 15))
+    
+#     # 绘制基本路网
+#     ox.plot_graph(G, ax=ax, node_size=0, edge_linewidth=0.5, edge_color='grey')
+    
+#     # 绘制高德提供的基本路径（fireworks）
+#     if fireworks:
+#         for i, firework in enumerate(fireworks):
+#             edges = [(firework[i], firework[i+1]) for i in range(len(firework)-1)]
+#             color = 'blue'
+#             ox.plot_graph_routes(G, firework, ax=ax, route_color=color, route_linewidth=1, route_alpha=0.5)
+    
+#     # 绘制最优路径
+#     if best_path:
+#         ox.plot_graph_route(G, best_path, ax=ax, route_color='red', route_linewidth=2)
+    
+#     # 标记起点和终点
+#     if origin and destination:
+#         # 绘制起点
+#         ax.scatter(origin[0], origin[1], c='green', s=100, marker='^', zorder=5)
+#         ax.annotate('Origin', (origin[0], origin[1]), fontsize=12)
+        
+#         # 绘制终点
+#         ax.scatter(destination[0], destination[1], c='red', s=100, marker='*', zorder=5)
+#         ax.annotate('Destination', (destination[0], destination[1]), fontsize=12)
+    
+#     plt.tight_layout()
+#     return fig

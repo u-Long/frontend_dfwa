@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OSM & AMap Route Planner</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Roboto', sans-serif;
+            background-color: #f0f2f5;
+        }
+        #container {
+            display: flex;
+            height: 100vh;
+        }
+        #sidebar {
+            width: 350px;
+            padding: 20px;
+            background-color: white;
+            overflow-y: auto;
+            box-shadow: 2px 0 5px rgba(0, 0, 0, 0.1);
+            border-radius: 10px;
+            margin: 10px;
+        }
+        #map {
+            flex-grow: 1;
+            height: 100%;
+            border-radius: 10px;
+            margin: 10px;
+        }
+        .input-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        input, select, button {
+            width: 100%;
+            padding: 10px;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            transition: all 0.3s;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .path-info {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #ffffff;
+            border-radius: 10px;
+            box-shadow: 0 0 5px rgba(0, 0, 0, 0.1);
+        }
+        h2, h3 {
+            font-weight: 600;
+            margin-bottom: 15px;
+        }
+        #plan-route, #pick-on-map {
+            margin-top: 10px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="sidebar">
+            <h2><i class="fa-solid fa-route"></i> 路径规划</h2>
+            <div class="input-group">
+                <label for="place"><i class="fa-solid fa-location-dot"></i> 地区:</label>
+                <input type="text" id="place" value="海淀区, 北京">
+            </div>
+            <div class="input-group">
+                <label for="origin-lng"><i class="fa-solid fa-map-marker-alt"></i> 起点经度:</label>
+                <input type="text" id="origin-lng" value="116.34899139404298">
+            </div>
+            <div class="input-group">
+                <label for="origin-lat"><i class="fa-solid fa-map-marker-alt"></i> 起点纬度:</label>
+                <input type="text" id="origin-lat" value="39.95976154261228">
+            </div>
+            <div class="input-group">
+                <label for="dest-lng"><i class="fa-solid fa-map-marker-alt"></i> 终点经度:</label>
+                <input type="text" id="dest-lng" value="116.30986976728312">
+            </div>
+            <div class="input-group">
+                <label for="dest-lat"><i class="fa-solid fa-map-marker-alt"></i> 终点纬度:</label>
+                <input type="text" id="dest-lat" value="39.99037781712655">
+            </div>
+            <div class="input-group">
+                <label for="amap-key"><i class="fa-solid fa-key"></i> 百度地图 API Key:</label>
+                <input type="text" id="amap-key" value="ZJcr2bfcgSCSxSDw2HdpodSPrC2CtvDd">
+            </div>
+            <div class="input-group">
+                <label for="use-speed"><i class="fa-solid fa-clock"></i> 使用速度作为权重:</label>
+                <select id="use-speed">
+                    <option value="false">否 (使用距离)</option>
+                    <option value="true">是 (使用时间)</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label for="num-sparks"><i class="fa-solid fa-bolt"></i> Spark 数量:</label>
+                <input type="number" id="num-sparks" value="150" min="50" max="200">
+            </div>
+            <button id="plan-route"><i class="fa-solid fa-paper-plane"></i> 规划路径</button>
+            <button id="pick-on-map"><i class="fa-solid fa-map-pin"></i> 在地图上选择点</button>
+            
+            <div class="path-info" id="path-info" style="display: none;">
+                <h3><i class="fa-solid fa-info-circle"></i> 路径信息</h3>
+                <div id="path-details"></div>
+            </div>
+            <!-- 加载动画 -->
+            <div id="loading-spinner" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 9999;">
+                <div style="border: 8px solid #f3f3f3; border-top: 8px solid #007bff; border-radius: 50%; width: 60px; height: 60px; animation: spin 1s linear infinite;"></div>
+            </div>
+        </div>
+        <div id="map"></div>
+    </div>
+
+    <script>
+        // 初始化地图
+        var map = L.map('map').setView([39.9042, 116.4074], 12);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+        
+        // 用于存储标记和路径
+        var markers = [];
+        var paths = [];
+        
+        // 点击地图选择点
+        document.getElementById('pick-on-map').addEventListener('click', function() {
+            pickingMode = true;
+            pickingOrigin = true;
+            alert('点击地图选择起点');
+        });
+        
+        map.on('click', function(e) {
+            if (!pickingMode) return;
+            
+            var lat = e.latlng.lat;
+            var lng = e.latlng.lng;
+            
+            if (pickingOrigin) {
+                document.getElementById('origin-lat').value = lat;
+                document.getElementById('origin-lng').value = lng;
+                alert('现在点击地图选择终点');
+                pickingOrigin = false;
+            } else {
+                document.getElementById('dest-lat').value = lat;
+                document.getElementById('dest-lng').value = lng;
+                pickingMode = false;
+            }
+        });
+        
+        // 规划路径
+        document.getElementById('plan-route').addEventListener('click', function() {
+            var originLng = document.getElementById('origin-lng').value;
+            var originLat = document.getElementById('origin-lat').value;
+            var destLng = document.getElementById('dest-lng').value;
+            var destLat = document.getElementById('dest-lat').value;
+            var amapKey = document.getElementById('amap-key').value;
+            var useSpeed = document.getElementById('use-speed').value === 'true';
+            var numSparks = parseInt(document.getElementById('num-sparks').value);
+            
+            // 清除已有标记和路径
+            clearMap();
+            
+            // 添加起点和终点标记
+            addMarker([originLat, originLng], '起点', 'green');
+            addMarker([destLat, destLng], '终点', 'red');
+            
+            // 设置地图视图
+            map.fitBounds([
+                [originLat, originLng],
+                [destLat, destLng]
+            ]);
+            
+            // 显示加载动画 (仅当使用速度作为权重时)
+            if (useSpeed) {
+                document.getElementById('loading-spinner').style.display = 'block';
+            }
+
+            // 向后端请求路径规划
+            fetch('http://127.0.0.1:5000/plan_route', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    origin_lat: originLat,
+                    origin_lng: originLng,
+                    dest_lat: destLat,
+                    dest_lng: destLng,
+                    amap_key: amapKey,
+                    use_speed: useSpeed,
+                    num_sparks: numSparks
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('loading-spinner').style.display = 'none'; // 隐藏加载动画
+
+                console.log(data);
+                if (data.best_path) {
+                    // 显示路径信息
+                    var bestPath = data.best_path;
+                    var road_info = data.road_info;
+
+                    var trafficHTML = '';
+                    if (road_info && Object.keys(road_info).length > 0) {
+                        trafficHTML += `<p>路径路况:</p><ul>`;
+                        for (const road in road_info) {
+                            const desc = road_info[road].description;
+                            if (desc) {
+                                trafficHTML += `<li>${desc}</li>`;
+                            }
+                        }
+                        trafficHTML += `</ul>`;
+                    } else {
+                        trafficHTML = `<p>路径路况: 暂无路况信息</p>`;
+                    }
+    
+                    // 绘制最优路径
+                    var best = L.polyline(bestPath, {color: 'red', weight: 4}).addTo(map);
+                    
+                    // 再画一下起点与bestPath[0]的连线以及终点与bestPath[bestPath.length-1]的连线
+                    var startLine = L.polyline([bestPath[0], [originLat, originLng]], {color: 'red', weight: 4}).addTo(map);
+                    var endLine = L.polyline([bestPath[bestPath.length-1], [destLat, destLng]], {color: 'red', weight: 4}).addTo(map);
+    
+                    
+                    // 高亮显示拥堵路段（例如：橙色加粗线条）
+                    // if (road_info && Object.keys(road_info).length > 0) {
+                    //     for (const road in road_info) {
+                    //         const roadData = road_info[road];
+                    //         if (roadData.node_coo && roadData.node_coo.length > 0) {
+                    //             // 绘制拥堵路段，线宽稍微加粗一些
+                    //             var congestedLine = L.polyline(roadData.node_coo, {color: 'orange', weight: 6}).addTo(map);
+                    //             // 绑定弹出框显示详细信息
+                    //             congestedLine.bindPopup(`<b>${road}</b><br>${roadData.description}<br>速度: ${roadData.speed}`);
+                    //         }
+                    //     }
+                    // }        
+                    paths.push(best, startLine, endLine);
+                    
+                    // 更新路径信息
+                    var distance = calculateDistance(bestPath).toFixed(2);
+                    document.getElementById('path-details').innerHTML = `
+                        <p>起点: (${originLat}, ${originLng})</p>
+                        <p>终点: (${destLat}, ${destLng})</p>
+                        <p>总距离: ${distance} km</p>
+                        <p>路径类型: ${useSpeed ? '基于时间' : '基于距离'}</p>
+                        <p>生成的Spark数: ${numSparks}</p>
+                        <p>地图链接: <a href="${data.map_url}" target="_blank">查看交互式地图</a></p>
+                        ${trafficHTML}
+                    `;
+                    document.getElementById('path-info').style.display = 'block';
+                } else {
+                    alert("无法找到最佳路径");
+                }
+            })
+            .catch(error => {
+                document.getElementById('loading-spinner').style.display = 'none'; // 隐藏加载动画
+                alert("路径规划请求失败: " + error);
+            });
+        });
+        
+        function clearMap() {
+            // 清除标记
+            markers.forEach(function(marker) {
+                map.removeLayer(marker);
+            });
+            markers = [];
+            
+            // 清除路径
+            paths.forEach(function(path) {
+                map.removeLayer(path);
+            });
+            paths = [];
+        }
+        
+        function addMarker(latLng, title, color) {
+            var icon = L.divIcon({
+                className: 'custom-div-icon',
+                html: `<div style="background-color: ${color}; width: 12px; height: 12px; border-radius: 50%;"></div>`,
+                iconSize: [12, 12],
+                iconAnchor: [6, 6]
+            });
+            
+            var marker = L.marker(latLng, {icon: icon}).addTo(map);
+            marker.bindPopup(title);
+            markers.push(marker);
+            return marker;
+        }
+        
+        function calculateDistance(path) {
+            var distance = 0;
+            for (var i = 0; i < path.length - 1; i++) {
+                distance += getDistanceFromLatLonInKm(path[i][0], path[i][1], path[i+1][0], path[i+1][1]);
+            }
+            return distance;
+        }
+        
+        function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
+            var R = 6371; // 地球半径（千米）
+            var dLat = deg2rad(lat2 - lat1);
+            var dLon = deg2rad(lon2 - lon1); 
+            var a = 
+                Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * 
+                Math.sin(dLon/2) * Math.sin(dLon/2); 
+            var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+            var d = R * c; // 距离（千米）
+            return d;
+        }
+        
+        function deg2rad(deg) {
+            return deg * (Math.PI/180)
+        }
+    </script>
+</body>
+</html>
