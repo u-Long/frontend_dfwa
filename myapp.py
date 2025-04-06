@@ -18,11 +18,12 @@ def plan_route():
     amap_key = data['amap_key']
     use_speed = data['use_speed']
     num_sparks = int(data['num_sparks'])
+    really_use_api = data.get('really_use_api', False)
     # 打印参数
-    print(f"Origin: {origin}, Destination: {destination}, Amap Key: {amap_key}, Use Speed: {use_speed}, Num Sparks: {num_sparks}")
+    print(f"Origin: {origin}, Destination: {destination}, Amap Key: {amap_key}, Use Speed: {use_speed}, Num Sparks: {num_sparks}, Really Use API: {really_use_api}")
 
     # 计算最佳路径
-    best_path, updated_G, fireworks, all_paths, road_info = find_best_path(G, diG, origin, destination, amap_key, use_speed, num_sparks, really_use_api=True)
+    best_path, updated_G, fireworks, all_paths, road_info = find_best_path(G, diG, origin, destination, amap_key, use_speed, num_sparks, really_use_api=really_use_api)
 
     if best_path:
         # 可视化路径并保存地图

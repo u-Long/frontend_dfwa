@@ -89,20 +89,12 @@
                 <input type="text" id="place" value="海淀区, 北京">
             </div>
             <div class="input-group">
-                <label for="origin-lng"><i class="fa-solid fa-map-marker-alt"></i> 起点经度:</label>
-                <input type="text" id="origin-lng" value="116.34899139404298">
+                <label for="origin-coords"><i class="fa-solid fa-map-marker-alt"></i> 起点 (经度, 纬度):</label>
+                <input type="text" id="origin-coords" value="116.34899139404298, 39.95976154261228">
             </div>
             <div class="input-group">
-                <label for="origin-lat"><i class="fa-solid fa-map-marker-alt"></i> 起点纬度:</label>
-                <input type="text" id="origin-lat" value="39.95976154261228">
-            </div>
-            <div class="input-group">
-                <label for="dest-lng"><i class="fa-solid fa-map-marker-alt"></i> 终点经度:</label>
-                <input type="text" id="dest-lng" value="116.30986976728312">
-            </div>
-            <div class="input-group">
-                <label for="dest-lat"><i class="fa-solid fa-map-marker-alt"></i> 终点纬度:</label>
-                <input type="text" id="dest-lat" value="39.99037781712655">
+                <label for="dest-coords"><i class="fa-solid fa-map-marker-alt"></i> 终点 (经度, 纬度):</label>
+                <input type="text" id="dest-coords" value="116.30986976728312, 39.99037781712655">
             </div>
             <div class="input-group">
                 <label for="amap-key"><i class="fa-solid fa-key"></i> 百度地图 API Key:</label>
@@ -116,12 +108,19 @@
                 </select>
             </div>
             <div class="input-group">
+                <label for="using-cache"><i class="fa-solid fa-sync"></i> 使用缓存:</label>
+                <select id="using-cache">
+                    <option value="false">否</option>
+                    <option value="true">是</option>
+                </select>
+            </div>
+            <div class="input-group">
                 <label for="num-sparks"><i class="fa-solid fa-bolt"></i> Spark 数量:</label>
                 <input type="number" id="num-sparks" value="150" min="50" max="200">
             </div>
             <button id="plan-route"><i class="fa-solid fa-paper-plane"></i> 规划路径</button>
             <button id="pick-on-map"><i class="fa-solid fa-map-pin"></i> 在地图上选择点</button>
-            
+    
             <div class="path-info" id="path-info" style="display: none;">
                 <h3><i class="fa-solid fa-info-circle"></i> 路径信息</h3>
                 <div id="path-details"></div>
@@ -159,26 +158,28 @@
             var lng = e.latlng.lng;
             
             if (pickingOrigin) {
-                document.getElementById('origin-lat').value = lat;
-                document.getElementById('origin-lng').value = lng;
+                document.getElementById('origin-coords').value = `${lng}, ${lat}`;
                 alert('现在点击地图选择终点');
                 pickingOrigin = false;
             } else {
-                document.getElementById('dest-lat').value = lat;
-                document.getElementById('dest-lng').value = lng;
+                document.getElementById('dest-coords').value = `${lng}, ${lat}`;
                 pickingMode = false;
             }
         });
         
         // 规划路径
         document.getElementById('plan-route').addEventListener('click', function() {
-            var originLng = document.getElementById('origin-lng').value;
-            var originLat = document.getElementById('origin-lat').value;
-            var destLng = document.getElementById('dest-lng').value;
-            var destLat = document.getElementById('dest-lat').value;
+            var originCoords = document.getElementById('origin-coords').value.split(',').map(Number);
+            var destCoords = document.getElementById('dest-coords').value.split(',').map(Number);
+            var originLng = originCoords[0];
+            var originLat = originCoords[1];
+            var destLng = destCoords[0];
+            var destLat = destCoords[1];
             var amapKey = document.getElementById('amap-key').value;
             var useSpeed = document.getElementById('use-speed').value === 'true';
             var numSparks = parseInt(document.getElementById('num-sparks').value);
+            var usingCache = document.getElementById('using-cache').value === 'true';
+            var reallyUseApi = usingCache ? false : true;
             
             // 清除已有标记和路径
             clearMap();
@@ -211,7 +212,8 @@
                     dest_lng: destLng,
                     amap_key: amapKey,
                     use_speed: useSpeed,
-                    num_sparks: numSparks
+                    num_sparks: numSparks,
+                    really_use_api: reallyUseApi
                 })
             })
             .then(response => response.json())
